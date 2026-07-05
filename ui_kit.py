@@ -148,6 +148,66 @@ def icon_scissors(img, center, size, color, thickness=4):
     cv2.line(img, (cx, cy), (cx + size, cy), color, thickness, cv2.LINE_AA)
 
 
+def icon_trophy(img, center, size, color, thickness=3):
+    """آیکون برداری جام قهرمانی برای اسکوربورد و صفحه‌ی پایان بازی."""
+    cx, cy = center
+    cup_w = size
+    cup_top = cy - size
+    cup_bottom = cy
+    # بدنه‌ی جام (ذوزنقه)
+    pts = np.array([
+        [cx - cup_w, cup_top], [cx + cup_w, cup_top],
+        [cx + cup_w // 2, cup_bottom], [cx - cup_w // 2, cup_bottom],
+    ], np.int32)
+    cv2.polylines(img, [pts], True, color, thickness, cv2.LINE_AA)
+    # دسته‌های جام
+    cv2.ellipse(img, (cx - cup_w - size // 4, cup_top + size // 3), (size // 4, size // 3), 0, -90, 90, color, thickness, cv2.LINE_AA)
+    cv2.ellipse(img, (cx + cup_w + size // 4, cup_top + size // 3), (size // 4, size // 3), 0, 90, 270, color, thickness, cv2.LINE_AA)
+    # پایه
+    stem_w = size // 6
+    cv2.line(img, (cx, cup_bottom), (cx, cup_bottom + size // 2), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (cx - size // 2, cup_bottom + size // 2), (cx + size // 2, cup_bottom + size // 2), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (cx - size // 2, cup_bottom + size // 2 + 6), (cx + size // 2, cup_bottom + size // 2 + 6), color, thickness, cv2.LINE_AA)
+
+
+def _measure_pill(key_label, action_label):
+    font_scale = 0.5
+    key_size = cv2.getTextSize(key_label, FONT, font_scale, 1)[0]
+    pad_x = 10
+    key_w = key_size[0] + pad_x * 2
+    action_size = cv2.getTextSize(action_label, FONT, font_scale, 1)[0]
+    return key_w + 8 + action_size[0] + 24
+
+
+def hotkey_bar(img, y, items, center_x):
+    """items: لیستی از (key_label, action_label, color). دکمه‌ها را وسط‌چین کنار هم می‌چیند."""
+    widths = [_measure_pill(k, a) for k, a, _ in items]
+    total = sum(widths) - 24
+    x = int(center_x - total / 2)
+    for (k, a, c), wdt in zip(items, widths):
+        key_pill(img, x, y, k, a, color=c)
+        x += wdt
+
+
+def key_pill(img, x, y, key_label, action_label, color=WHITE, key_color=None):
+    """یک 'دکمه‌ی کلید' شبیه کیبورد + توضیح کوتاه کنارش؛ برای نوار راهنمای کلیدها.
+    خروجی: عرض کل ناحیه‌ی رسم‌شده (برای چیدن پیل بعدی کنار آن)."""
+    key_color = key_color or color
+    font_scale = 0.5
+    key_size = cv2.getTextSize(key_label, FONT, font_scale, 1)[0]
+    pad_x, pad_y = 10, 6
+    key_w = key_size[0] + pad_x * 2
+    key_h = key_size[1] + pad_y * 2
+    rounded_rect(img, (x, y), (x + key_w, y + key_h), PANEL, radius=8, alpha=0.9)
+    rounded_rect(img, (x, y), (x + key_w, y + key_h), key_color, radius=8, thickness=1)
+    glow_text(img, key_label, (x + pad_x, y + key_h - pad_y), font_scale, key_color, 1)
+
+    action_size = cv2.getTextSize(action_label, FONT, font_scale, 1)[0]
+    ax = x + key_w + 8
+    glow_text(img, action_label, (ax, y + key_h - pad_y), font_scale, color, 1)
+    return key_w + 8 + action_size[0] + 24  # فاصله تا آیتم بعدی
+
+
 ICONS = {"ROCK": icon_rock, "PAPER": icon_paper, "SCISSORS": icon_scissors}
 LABELS_FA = {"ROCK": "SANG", "PAPER": "KAGHAZ", "SCISSORS": "GHEYCHI"}
 

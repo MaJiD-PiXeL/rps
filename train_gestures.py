@@ -30,7 +30,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score
 import joblib
 
-from hand_utils import HandTracker, draw_hand_skeleton
+from hand_utils import HandTracker, draw_hand_skeleton, extract_features, augment_landmarks
 import ui_kit as ui
 
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gesture_model.pkl")
@@ -65,10 +65,10 @@ def main():
         h, w = frame.shape[:2]
 
         hands = tracker.process(frame)
-        current_features = hands[0]["features"] if hands else None
+        current_hand = hands[0] if hands else None
 
-        if hands:
-            draw_hand_skeleton(frame, hands[0]["landmarks_px"], ui.GOLD, ui.WHITE)
+        if current_hand:
+            draw_hand_skeleton(frame, current_hand["landmarks_px"], ui.GOLD, ui.WHITE)
 
         # ---------------- هدر ----------------
         ui.rounded_rect(frame, (0, 0), (w, 90), ui.BG_DARK, radius=0, alpha=0.65)
@@ -91,7 +91,7 @@ def main():
             ui.centered_text(frame, f"{count} sample", cx, panel_y + 118, 0.5, ui.WHITE, 1)
 
         # ---------------- وضعیت لحظه‌ای ----------------
-        if current_features is None:
+        if current_hand is None:
             hint_color = ui.RED
             hint_text = "دستی دیده نمی‌شود..."
         else:
@@ -115,9 +115,9 @@ def main():
         if key in (ord('q'), 27):
             break
 
-        elif key in KEY_TO_LABEL and current_features is not None:
+        elif key in KEY_TO_LABEL and current_hand is not None:
             label = KEY_TO_LABEL[key]
-            dataset[label].append(current_features)
+            dataset[label].append(current_hand["landmarks_norm"])
             last_captured_label = label
             last_captured_time = time.time()
             flash_until = time.time() + 0.35
@@ -131,11 +131,15 @@ def main():
             if not min_ok:
                 status_msg = "هنوز نمونه‌ی کافی جمع نشده."
                 continue
+
+            # هر نمونه‌ی خام را با augment_landmarks به چند نسخه (آینه‌ای + نویزی)
+            # تبدیل می‌کنیم تا مدل در برابر تغییر زاویه/دست چپ‌وراست مقاوم‌تر شود.
             X, y = [], []
-            for label, feats_list in dataset.items():
-                for feats in feats_list:
-                    X.append(feats)
-                    y.append(label)
+            for label, raw_samples in dataset.items():
+                for raw_pts in raw_samples:
+                    for variant in augment_landmarks(raw_pts):
+                        X.append(extract_features(variant))
+                        y.append(label)
             X = np.array(X)
             y = np.array(y)
 
@@ -146,18 +150,18 @@ def main():
             X_train, X_test, y_train, y_test = train_test_split(
                 X, y, test_size=0.2, random_state=42, stratify=y
             )
-            clf = RandomForestClassifier(n_estimators=200, max_depth=12, random_state=42)
+            clf = RandomForestClassifier(n_estimators=300, max_depth=16, random_state=42)
             clf.fit(X_train, y_train)
             acc = accuracy_score(y_test, clf.predict(X_test)) if len(X_test) > 0 else float("nan")
 
             # مدل نهایی روی کل داده (برای بیشترین دقت در بازی)
-            final_clf = RandomForestClassifier(n_estimators=200, max_depth=12, random_state=42)
+            final_clf = RandomForestClassifier(n_estimators=300, max_depth=16, random_state=42)
             final_clf.fit(X, y)
             joblib.dump({"model": final_clf, "labels": LABELS}, MODEL_PATH)
 
             print(f"مدل ذخیره شد در: {MODEL_PATH}")
             print(f"دقت روی داده‌ی تست (validation): {acc * 100:.1f}%")
-            print(f"تعداد نمونه‌ها: { {k: len(v) for k, v in dataset.items()} }")
+            print(f"تعداد نمونه‌های خام: { {k: len(v) for k, v in dataset.items()} }")
 
     tracker.close()
     cap.release()
