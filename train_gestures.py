@@ -157,7 +157,8 @@ def main():
             # مدل نهایی روی کل داده (برای بیشترین دقت در بازی)
             final_clf = RandomForestClassifier(n_estimators=300, max_depth=16, random_state=42)
             final_clf.fit(X, y)
-            joblib.dump({"model": final_clf, "labels": LABELS}, MODEL_PATH)
+            saved_labels = list(final_clf.classes_)  # ترتیب واقعی کلاس‌ها از خودِ مدل
+            joblib.dump({"model": final_clf, "labels": saved_labels}, MODEL_PATH)
 
             print(f"مدل ذخیره شد در: {MODEL_PATH}")
             print(f"دقت روی داده‌ی تست (validation): {acc * 100:.1f}%")

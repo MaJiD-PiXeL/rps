@@ -12,6 +12,7 @@ rps_game.py
 
 کنترل‌های کلی (بسته به حالت فعلی، نوار پایین صفحه هم راهنما را نشان می‌دهد):
     T          -> ورود به حالت تمرین دوباره (هر وقت بخواهی مدل را بهتر کنی)
+    N          -> تغییر اسم بازیکن‌ها
     SPACE      -> شروع دور جدید / دور بعد / مسابقه‌ی جدید
     R          -> ریست کامل امتیاز و شروع مسابقه‌ی جدید
     Q / ESC    -> خروج (در حالت تمرین: ESC فقط از تمرین خارج می‌شود)
@@ -30,7 +31,7 @@ import cv2
 import joblib
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 
 from hand_utils import HandTracker, draw_hand_skeleton, extract_features, augment_landmarks
 import ui_kit as ui
@@ -50,9 +51,11 @@ STATE_COUNTDOWN = "COUNTDOWN"
 STATE_RESULT = "RESULT"
 STATE_TRAIN = "TRAIN"
 STATE_GAME_OVER = "GAME_OVER"
+STATE_EDIT_NAMES = "EDIT_NAMES"
 
 HEADER_H = 132
 FOOTER_H = 58
+MAX_NAME_LEN = 12
 
 
 # ---------------------------------------------------------------------------
@@ -67,18 +70,27 @@ def load_model():
 
 
 def classify(model, labels, features):
+    """
+    توجه مهم: ترتیب کلاس‌ها در model.predict_proba برابر model.classes_ است،
+    که خودِ scikit-learn آن را به‌صورت الفبایی مرتب می‌کند (PAPER, ROCK,
+    SCISSORS) - نه لزوماً ترتیبی که ما در نظر داشتیم (ROCK, PAPER,
+    SCISSORS)! قبلاً همین اختلاف باعث جابه‌جا شدن تشخیص سنگ/کاغذ می‌شد.
+    برای همین همیشه از model.classes_ خودِ مدل استفاده می‌کنیم، نه از
+    لیست labels ذخیره‌شده.
+    """
     proba = model.predict_proba([features])[0]
     idx = int(np.argmax(proba))
     conf = float(proba[idx])
+    label = model.classes_[idx]
     if conf < CONFIDENCE_THRESHOLD:
         return None, conf
-    return labels[idx], conf
+    return label, conf
 
 
 def get_probabilities(model, labels, features):
-    """برای حالت دیباگ: احتمال هر سه کلاس را برمی‌گرداند، مثلاً {'ROCK':0.1,...}."""
+    """برای حالت دیباگ: احتمال هر کلاس را برمی‌گرداند (بر اساس model.classes_)."""
     proba = model.predict_proba([features])[0]
-    return {label: float(p) for label, p in zip(labels, proba)}
+    return {cls: float(p) for cls, p in zip(model.classes_, proba)}
 
 
 def decide_winner(g1, g2):
@@ -123,19 +135,32 @@ def train_and_save_model(dataset):
     )
     clf = RandomForestClassifier(n_estimators=300, max_depth=16, random_state=42)
     clf.fit(X_train, y_train)
-    acc = accuracy_score(y_test, clf.predict(X_test)) if len(X_test) > 0 else float("nan")
+    y_pred = clf.predict(X_test)
+    acc = accuracy_score(y_test, y_pred) if len(X_test) > 0 else float("nan")
+
+    # گزارش دقیق: کدام حرکت با کدام حرکت اشتباه گرفته می‌شود (اگر مشکلی
+    # مثل قاطی شدن سنگ/کاغذ باقی مانده باشد، دقیقاً این‌جا مشخص می‌شود)
+    print("\n--- گزارش دقت مدل (روی داده‌ی نگه‌داشته‌شده برای تست) ---")
+    class_order = sorted(set(y))
+    cm = confusion_matrix(y_test, y_pred, labels=class_order)
+    print("ترتیب ردیف/ستون:", class_order)
+    print("سطر = برچسب واقعی، ستون = پیش‌بینی مدل:")
+    print(cm)
+    print(classification_report(y_test, y_pred, labels=class_order, zero_division=0))
+    print("---------------------------------------------------\n")
 
     final_clf = RandomForestClassifier(n_estimators=300, max_depth=16, random_state=42)
     final_clf.fit(X, y)
-    joblib.dump({"model": final_clf, "labels": LABELS}, MODEL_PATH)
-    return final_clf, LABELS, acc
+    saved_labels = list(final_clf.classes_)  # ترتیب واقعی کلاس‌ها از خودِ مدل (نه ترتیب دستی ما)
+    joblib.dump({"model": final_clf, "labels": saved_labels}, MODEL_PATH)
+    return final_clf, saved_labels, acc
 
 
 # ---------------------------------------------------------------------------
 #  رسم اسکوربورد و نوار راهنما (همیشه در دسترس)
 # ---------------------------------------------------------------------------
 
-def draw_scoreboard(frame, w, score1, score2, round_no, title):
+def draw_scoreboard(frame, w, score1, score2, round_no, title, name1, name2):
     """اسکوربورد اصلی بالای صفحه: نام بازیکن‌ها، امتیاز بزرگ، جام برای نفر جلوتر، دور فعلی."""
     ui.rounded_rect(frame, (14, 12), (w - 14, HEADER_H), ui.PANEL, radius=20, alpha=0.82)
     ui.rounded_rect(frame, (14, 12), (w - 14, HEADER_H), ui.GOLD, radius=20, thickness=2)
@@ -149,8 +174,8 @@ def draw_scoreboard(frame, w, score1, score2, round_no, title):
     ui.centered_text(frame, f"FIRST TO {TARGET_SCORE} WINS THE MATCH", cx, 115, 0.42, ui.GRAY, 1)
 
     # نام بازیکن‌ها + جام برای جلوتر بودن
-    ui.centered_text(frame, "PLAYER 1", int(w * 0.16), 45, 0.62, ui.CYAN_P1, 2)
-    ui.centered_text(frame, "PLAYER 2", int(w * 0.84), 45, 0.62, ui.MAGENTA_P2, 2)
+    ui.centered_text(frame, name1, int(w * 0.16), 45, 0.62, ui.CYAN_P1, 2)
+    ui.centered_text(frame, name2, int(w * 0.84), 45, 0.62, ui.MAGENTA_P2, 2)
     if score1 > score2:
         ui.icon_trophy(frame, (int(w * 0.16) - 70, 40), 12, ui.GOLD)
     elif score2 > score1:
@@ -263,6 +288,50 @@ def draw_training_ui(frame, w, h, dataset, current_gesture_ok, flash_until, last
 
 
 # ---------------------------------------------------------------------------
+#  ویرایش اسم بازیکن‌ها
+# ---------------------------------------------------------------------------
+
+def draw_name_editor(frame, w, h, name1, name2, active_field):
+    ui.rounded_rect(frame, (0, 0), (w, h), ui.BG_DARK, radius=0, alpha=0.6)
+
+    panel_w, panel_h = 560, 260
+    x1, y1 = w // 2 - panel_w // 2, h // 2 - panel_h // 2
+    x2, y2 = x1 + panel_w, y1 + panel_h
+    ui.rounded_rect(frame, (x1, y1), (x2, y2), ui.PANEL, radius=24, alpha=0.92)
+    ui.rounded_rect(frame, (x1, y1), (x2, y2), ui.GOLD, radius=24, thickness=2)
+
+    ui.centered_text(frame, "EDIT PLAYER NAMES", w // 2, y1 + 42, 0.8, ui.GOLD, 2)
+    ui.centered_text(frame, "Type on your keyboard  -  TAB: switch field  -  ENTER: confirm",
+                      w // 2, y1 + 70, 0.45, ui.WHITE, 1)
+
+    cursor_on = int(time.time() * 2) % 2 == 0  # چشمک‌زن ساده برای مکان‌نما
+
+    fields = [(name1, ui.CYAN_P1, "PLAYER 1"), (name2, ui.MAGENTA_P2, "PLAYER 2")]
+    fy = y1 + 110
+    for i, (name, color, label) in enumerate(fields):
+        box_x1, box_x2 = x1 + 60, x2 - 60
+        box_y1, box_y2 = fy, fy + 55
+        is_active = (i == active_field)
+        border_color = ui.GOLD if is_active else color
+        ui.rounded_rect(frame, (box_x1, box_y1), (box_x2, box_y2), ui.BG_DARK, radius=14, alpha=0.9)
+        ui.rounded_rect(frame, (box_x1, box_y1), (box_x2, box_y2), border_color, radius=14, thickness=2)
+        ui.centered_text(frame, label, box_x1 - 5, box_y1 - 10, 0.42, color, 1)
+
+        display_text = name + ("|" if (is_active and cursor_on) else "")
+        ui.glow_text(frame, display_text, (box_x1 + 18, box_y1 + 38), 0.65, ui.WHITE, 1)
+        fy += 85
+
+    ui.centered_text(frame, "Leave empty to keep default name", w // 2, y2 - 18, 0.4, ui.GRAY, 1)
+
+
+def sanitize_name_key(key):
+    """اگر کلید یک کاراکتر قابل چاپ ساده (حروف/عدد انگلیسی و چند نماد) بود، آن را برمی‌گرداند."""
+    if 32 <= key <= 126:
+        return chr(key)
+    return None
+
+
+# ---------------------------------------------------------------------------
 #  حلقه‌ی اصلی
 # ---------------------------------------------------------------------------
 
@@ -281,7 +350,12 @@ def main():
     score1, score2, round_no = 0, 0, 1
     state = STATE_IDLE if model is not None else STATE_NO_MODEL
     state_before_train = state
+    state_before_edit = state
     show_debug = False
+
+    player1_name, player2_name = "PLAYER 1", "PLAYER 2"
+    edit_names_buf = ["", ""]
+    edit_active_field = 0
 
     countdown_start = 0
     result_start = 0
@@ -342,6 +416,37 @@ def main():
                 state = STATE_IDLE
             continue  # بقیه‌ی حلقه (بازی) در حالت تمرین اجرا نشود
 
+        # ---------------- حالت ویرایش اسم بازیکن‌ها ----------------
+        if state == STATE_EDIT_NAMES:
+            draw_name_editor(frame, w, h, edit_names_buf[0], edit_names_buf[1], edit_active_field)
+            draw_hotkeys(frame, w, h, [
+                ("TAB", "Switch Field", ui.GOLD), ("ENTER", "Confirm", ui.GREEN),
+                ("BKSP", "Delete", ui.WHITE), ("ESC", "Cancel", ui.RED),
+            ])
+            cv2.imshow("Rock Paper Scissors", frame)
+            key = cv2.waitKey(1) & 0xFF
+
+            if key == 27:  # ESC - لغو بدون ذخیره تغییرات
+                state = state_before_edit
+            elif key == 9:  # TAB - جابه‌جایی بین فیلدها
+                edit_active_field = 1 - edit_active_field
+            elif key in (13, 10):  # ENTER
+                if edit_active_field == 0:
+                    edit_active_field = 1
+                else:
+                    if edit_names_buf[0].strip():
+                        player1_name = edit_names_buf[0].strip().upper()
+                    if edit_names_buf[1].strip():
+                        player2_name = edit_names_buf[1].strip().upper()
+                    state = state_before_edit
+            elif key == 8:  # Backspace
+                edit_names_buf[edit_active_field] = edit_names_buf[edit_active_field][:-1]
+            else:
+                ch = sanitize_name_key(key)
+                if ch and len(edit_names_buf[edit_active_field]) < MAX_NAME_LEN:
+                    edit_names_buf[edit_active_field] += ch
+            continue  # بقیه‌ی حلقه (بازی) در حالت ویرایش اسم اجرا نشود
+
         # ---------------- حالت بدون مدل (راهنما) ----------------
         if state == STATE_NO_MODEL:
             draw_onboarding(frame, w, h)
@@ -377,13 +482,14 @@ def main():
         ui.dashed_vline(frame, w // 2, HEADER_H + 10, h - FOOTER_H - 10, ui.GRAY, dash=16, gap=12, thickness=2)
 
         title = f"ROUND {round_no}" if state != STATE_GAME_OVER else "MATCH OVER"
-        draw_scoreboard(frame, w, score1, score2, round_no, title)
-        draw_player_panel(frame, w * 0.22, ui.CYAN_P1, "PLAYER 1", gesture1, conf1, probs1)
-        draw_player_panel(frame, w * 0.78, ui.MAGENTA_P2, "PLAYER 2", gesture2, conf2, probs2)
+        draw_scoreboard(frame, w, score1, score2, round_no, title, player1_name, player2_name)
+        draw_player_panel(frame, w * 0.22, ui.CYAN_P1, player1_name, gesture1, conf1, probs1)
+        draw_player_panel(frame, w * 0.78, ui.MAGENTA_P2, player2_name, gesture2, conf2, probs2)
 
         if state == STATE_IDLE:
             draw_hotkeys(frame, w, h, [
                 ("SPACE", "Start Round", ui.GOLD), ("T", "Retrain", ui.CYAN_P1),
+                ("N", "Names", ui.MAGENTA_P2),
                 ("D", "Debug" if not show_debug else "Debug: ON", ui.GOLD if show_debug else ui.WHITE),
                 ("R", "Reset", ui.WHITE), ("Q", "Quit", ui.RED),
             ])
@@ -442,12 +548,12 @@ def main():
 
             draw_hotkeys(frame, w, h, [
                 ("SPACE", "Next Round", ui.GOLD), ("T", "Retrain", ui.CYAN_P1),
-                ("R", "Reset", ui.WHITE), ("Q", "Quit", ui.RED),
+                ("N", "Names", ui.MAGENTA_P2), ("R", "Reset", ui.WHITE), ("Q", "Quit", ui.RED),
             ])
 
         elif state == STATE_GAME_OVER:
             cx, cy = w // 2, (HEADER_H + h - FOOTER_H) // 2
-            winner_name = "PLAYER 1" if score1 > score2 else "PLAYER 2"
+            winner_name = player1_name if score1 > score2 else player2_name
             winner_color = ui.CYAN_P1 if score1 > score2 else ui.MAGENTA_P2
             ui.rounded_rect(frame, (cx - 260, cy - 110), (cx + 260, cy + 110), ui.PANEL, radius=26, alpha=0.9)
             ui.rounded_rect(frame, (cx - 260, cy - 110), (cx + 260, cy + 110), ui.GOLD, radius=26, thickness=3)
@@ -457,7 +563,8 @@ def main():
             cv2.rectangle(frame, (4, 4), (w - 4, h - 4), ui.GOLD, 8, cv2.LINE_AA)
 
             draw_hotkeys(frame, w, h, [
-                ("SPACE", "New Match", ui.GOLD), ("T", "Retrain", ui.CYAN_P1), ("Q", "Quit", ui.RED),
+                ("SPACE", "New Match", ui.GOLD), ("T", "Retrain", ui.CYAN_P1),
+                ("N", "Names", ui.MAGENTA_P2), ("Q", "Quit", ui.RED),
             ])
 
         cv2.imshow("Rock Paper Scissors", frame)
@@ -469,6 +576,11 @@ def main():
             train_dataset = {label: [] for label in LABELS}
             state_before_train = STATE_IDLE
             state = STATE_TRAIN
+        elif key == ord('n') and state in (STATE_IDLE, STATE_RESULT, STATE_GAME_OVER):
+            edit_names_buf = [player1_name, player2_name]
+            edit_active_field = 0
+            state_before_edit = state
+            state = STATE_EDIT_NAMES
         elif key == ord('d'):
             show_debug = not show_debug
         elif key == ord(' ') and state in (STATE_IDLE, STATE_RESULT):
