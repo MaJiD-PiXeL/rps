@@ -14,6 +14,7 @@ hand_utils.py
 """
 
 import os
+import sys
 import time
 import urllib.request
 
@@ -36,6 +37,18 @@ except ImportError as e:
     ) from e
 
 HAND_CONNECTIONS = [(c.start, c.end) for c in HandLandmarksConnections.HAND_CONNECTIONS]
+
+
+def get_base_dir():
+    """
+    پوشه‌ای که فایل‌های کنارِ برنامه (مدل، تنظیمات) باید در آن ذخیره/خوانده شوند.
+    وقتی برنامه به exe تبدیل شده باشد (PyInstaller)، فایل‌های bundle‌شده در
+    یک پوشه‌ی موقت استخراج می‌شوند که بین اجراها پاک می‌شود؛ برای همین در آن
+    حالت باید کنار خودِ فایل exe (نه پوشه‌ی موقت) ذخیره کنیم تا ماندگار بماند.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
 _MODEL_URLS = [
     # آدرس پایدار و نسخه‌دار (همانی که در نمونه‌های رسمی گوگل استفاده می‌شود)
@@ -67,7 +80,7 @@ def _download_file(url, dest_path):
 
 
 def _ensure_model_downloaded():
-    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), _MODEL_FILENAME)
+    model_path = os.path.join(get_base_dir(), _MODEL_FILENAME)
     if os.path.exists(model_path):
         return model_path
 

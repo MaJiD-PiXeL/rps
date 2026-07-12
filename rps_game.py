@@ -13,6 +13,8 @@ rps_game.py
 کنترل‌های کلی (بسته به حالت فعلی، نوار پایین صفحه هم راهنما را نشان می‌دهد):
     T          -> ورود به حالت تمرین دوباره (هر وقت بخواهی مدل را بهتر کنی)
     N          -> تغییر اسم بازیکن‌ها
+    C          -> تغییر حالت دو‌نفره / تک‌نفره در برابر کامپیوتر
+    M          -> قطع/وصل صدا
     SPACE      -> شروع دور جدید / دور بعد / مسابقه‌ی جدید
     R          -> ریست کامل امتیاز و شروع مسابقه‌ی جدید
     Q / ESC    -> خروج (در حالت تمرین: ESC فقط از تمرین خارج می‌شود)
@@ -25,6 +27,8 @@ rps_game.py
 """
 
 import os
+import json
+import random
 import time
 import numpy as np
 import cv2
@@ -33,10 +37,12 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 
-from hand_utils import HandTracker, draw_hand_skeleton, extract_features, augment_landmarks
+from hand_utils import HandTracker, draw_hand_skeleton, extract_features, augment_landmarks, get_base_dir
 import ui_kit as ui
+import audio
 
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gesture_model.pkl")
+MODEL_PATH = os.path.join(get_base_dir(), "gesture_model.pkl")
+GAME_DATA_PATH = os.path.join(get_base_dir(), "game_data.json")
 CONFIDENCE_THRESHOLD = 0.55
 BEATS = {"ROCK": "SCISSORS", "SCISSORS": "PAPER", "PAPER": "ROCK"}
 LABELS = ["ROCK", "PAPER", "SCISSORS"]
@@ -44,6 +50,11 @@ KEY_TO_LABEL = {ord('1'): "ROCK", ord('2'): "PAPER", ord('3'): "SCISSORS"}
 MIN_SAMPLES_PER_CLASS = 15
 RECOMMENDED_SAMPLES = 40
 TARGET_SCORE = 5  # اولین کسی که به این امتیاز برسد، برنده‌ی مسابقه است
+CAPTURE_WINDOW = 0.5  # ثانیه: مدت‌زمان جمع‌آوری چند فریم پس از پایان شمارش معکوس (هموارسازی زمانی)
+
+MODE_TWO_PLAYER = "TWO_PLAYER"
+MODE_VS_COMPUTER = "VS_COMPUTER"
+COMPUTER_NAME = "COMPUTER"
 
 STATE_NO_MODEL = "NO_MODEL"
 STATE_IDLE = "IDLE"
@@ -99,6 +110,71 @@ def decide_winner(g1, g2):
     if g1 == g2:
         return "TIE"
     return "P1" if BEATS[g1] == g2 else "P2"
+
+
+def pick_computer_move():
+    """حرکت تصادفی کامپیوتر برای حالت تک‌نفره."""
+    return random.choice(LABELS)
+
+
+def resolve_smoothed(prob_sum, frame_count):
+    """
+    از مجموع احتمالات جمع‌آوری‌شده در چند فریمِ پنجره‌ی ثبت (به‌جای فقط یک
+    فریم لحظه‌ای)، میانگین می‌گیرد و نتیجه‌ی نهایی و مطمئن‌تری برمی‌گرداند.
+    این باعث می‌شود اگر دقیقاً همان لحظه‌ی صفر شدن شمارش، دست در حال حرکت
+    یا گذر بین دو حالت بوده، تصمیم نهایی گیج نشود.
+    """
+    if frame_count == 0 or not prob_sum:
+        return None, 0.0
+    avg = {k: v / frame_count for k, v in prob_sum.items()}
+    label = max(avg, key=avg.get)
+    conf = avg[label]
+    if conf < CONFIDENCE_THRESHOLD:
+        return None, conf
+    return label, conf
+
+
+# ---------------------------------------------------------------------------
+#  ذخیره‌ی اسم‌ها و آمار بین اجراهای مختلف برنامه
+# ---------------------------------------------------------------------------
+
+def load_game_data():
+    default = {"last_names": ["PLAYER 1", "PLAYER 2"], "players": {}}
+    if not os.path.exists(GAME_DATA_PATH):
+        return default
+    try:
+        with open(GAME_DATA_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.setdefault("last_names", default["last_names"])
+        data.setdefault("players", {})
+        return data
+    except Exception:
+        return default
+
+
+def save_game_data(data):
+    try:
+        with open(GAME_DATA_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"ذخیره‌ی فایل آمار ناموفق بود: {e}")
+
+
+def record_match_result(game_data, winner_name, loser_name):
+    """آمار مسابقه‌ی تمام‌شده را برای هر دو بازیکن به‌روزرسانی و ذخیره می‌کند."""
+    players = game_data["players"]
+    for name in (winner_name, loser_name):
+        players.setdefault(name, {"matches": 0, "match_wins": 0})
+        players[name]["matches"] += 1
+    players[winner_name]["match_wins"] += 1
+    save_game_data(game_data)
+
+
+def get_player_record(game_data, name):
+    rec = game_data["players"].get(name)
+    if not rec or rec["matches"] == 0:
+        return None
+    return f"{rec['match_wins']}W - {rec['matches'] - rec['match_wins']}L"
 
 
 def assign_hands_to_players(hands, frame_w):
@@ -188,7 +264,7 @@ def draw_hotkeys(frame, w, h, items):
     ui.hotkey_bar(frame, h - FOOTER_H + 16, items, w // 2)
 
 
-def draw_player_panel(frame, x_center, color, name, gesture, confidence, debug_probs=None):
+def draw_player_panel(frame, x_center, color, name, gesture, confidence, debug_probs=None, record_text=None):
     w_panel = 190
     y1, y2 = HEADER_H + 14, HEADER_H + 128
     x1 = int(x_center - w_panel / 2)
@@ -206,9 +282,11 @@ def draw_player_panel(frame, x_center, color, name, gesture, confidence, debug_p
     ui.progress_bar(frame, (x1 + 15, y1 + 88), (x2 - 15, y1 + 98), confidence, color)
     ui.centered_text(frame, name, x_center, y2 - 8, 0.42, color, 1)
 
-    if debug_probs:
+    if record_text:
+        ui.centered_text(frame, record_text, x_center, y2 + 18, 0.4, ui.GRAY, 1)
+    elif debug_probs:
         txt = "  ".join(f"{k[0]}:{int(v * 100)}" for k, v in debug_probs.items())
-        ui.centered_text(frame, txt, x_center, y2 + 20, 0.42, ui.GOLD, 1)
+        ui.centered_text(frame, txt, x_center, y2 + 18, 0.42, ui.GOLD, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -291,7 +369,7 @@ def draw_training_ui(frame, w, h, dataset, current_gesture_ok, flash_until, last
 #  ویرایش اسم بازیکن‌ها
 # ---------------------------------------------------------------------------
 
-def draw_name_editor(frame, w, h, name1, name2, active_field):
+def draw_name_editor(frame, w, h, buf1, buf2, active_field, current1, current2):
     ui.rounded_rect(frame, (0, 0), (w, h), ui.BG_DARK, radius=0, alpha=0.6)
 
     panel_w, panel_h = 560, 260
@@ -306,9 +384,9 @@ def draw_name_editor(frame, w, h, name1, name2, active_field):
 
     cursor_on = int(time.time() * 2) % 2 == 0  # چشمک‌زن ساده برای مکان‌نما
 
-    fields = [(name1, ui.CYAN_P1, "PLAYER 1"), (name2, ui.MAGENTA_P2, "PLAYER 2")]
+    fields = [(buf1, current1, ui.CYAN_P1, "PLAYER 1"), (buf2, current2, ui.MAGENTA_P2, "PLAYER 2")]
     fy = y1 + 110
-    for i, (name, color, label) in enumerate(fields):
+    for i, (buf, current, color, label) in enumerate(fields):
         box_x1, box_x2 = x1 + 60, x2 - 60
         box_y1, box_y2 = fy, fy + 55
         is_active = (i == active_field)
@@ -317,11 +395,15 @@ def draw_name_editor(frame, w, h, name1, name2, active_field):
         ui.rounded_rect(frame, (box_x1, box_y1), (box_x2, box_y2), border_color, radius=14, thickness=2)
         ui.centered_text(frame, label, box_x1 - 5, box_y1 - 10, 0.42, color, 1)
 
-        display_text = name + ("|" if (is_active and cursor_on) else "")
-        ui.glow_text(frame, display_text, (box_x1 + 18, box_y1 + 38), 0.65, ui.WHITE, 1)
+        if buf:
+            display_text = buf + ("|" if (is_active and cursor_on) else "")
+            ui.glow_text(frame, display_text, (box_x1 + 18, box_y1 + 38), 0.65, ui.WHITE, 1)
+        else:
+            cursor = "|" if (is_active and cursor_on) else ""
+            ui.glow_text(frame, cursor + f"({current})", (box_x1 + 18, box_y1 + 38), 0.65, ui.GRAY, 1)
         fy += 85
 
-    ui.centered_text(frame, "Leave empty to keep default name", w // 2, y2 - 18, 0.4, ui.GRAY, 1)
+    ui.centered_text(frame, "Leave empty to keep current name", w // 2, y2 - 18, 0.4, ui.GRAY, 1)
 
 
 def sanitize_name_key(key):
@@ -337,6 +419,7 @@ def sanitize_name_key(key):
 
 def main():
     model, labels = load_model()
+    game_data = load_game_data()
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -352,15 +435,24 @@ def main():
     state_before_train = state
     state_before_edit = state
     show_debug = False
+    game_mode = MODE_TWO_PLAYER
 
-    player1_name, player2_name = "PLAYER 1", "PLAYER 2"
+    player1_name, player2_name = game_data["last_names"]
     edit_names_buf = ["", ""]
     edit_active_field = 0
 
     countdown_start = 0
+    last_tick_second = -1
+    capture_announced = False
     result_start = 0
     last_result_text = ""
     last_g1, last_g2 = None, None
+
+    # بافرهای هموارسازی زمانی: چند فریم آخرِ پنجره‌ی ثبت را جمع می‌کنند
+    # تا تصمیم نهایی به یک فریم لحظه‌ای حساس نباشد
+    prob_sum1, frames1 = {}, 0
+    prob_sum2, frames2 = {}, 0
+    computer_move = None
 
     # داده‌های حالت تمرین
     train_dataset = {label: [] for label in LABELS}
@@ -418,7 +510,8 @@ def main():
 
         # ---------------- حالت ویرایش اسم بازیکن‌ها ----------------
         if state == STATE_EDIT_NAMES:
-            draw_name_editor(frame, w, h, edit_names_buf[0], edit_names_buf[1], edit_active_field)
+            draw_name_editor(frame, w, h, edit_names_buf[0], edit_names_buf[1], edit_active_field,
+                              player1_name, player2_name)
             draw_hotkeys(frame, w, h, [
                 ("TAB", "Switch Field", ui.GOLD), ("ENTER", "Confirm", ui.GREEN),
                 ("BKSP", "Delete", ui.WHITE), ("ESC", "Cancel", ui.RED),
@@ -438,6 +531,8 @@ def main():
                         player1_name = edit_names_buf[0].strip().upper()
                     if edit_names_buf[1].strip():
                         player2_name = edit_names_buf[1].strip().upper()
+                    game_data["last_names"] = [player1_name, player2_name]
+                    save_game_data(game_data)
                     state = state_before_edit
             elif key == 8:  # Backspace
                 edit_names_buf[edit_active_field] = edit_names_buf[edit_active_field][:-1]
@@ -462,65 +557,116 @@ def main():
             continue
 
         # ---------------- از این‌جا به بعد: بازی واقعی (مدل موجود است) ----------------
-        p1_hand, p2_hand = assign_hands_to_players(hands, w)
+        if game_mode == MODE_VS_COMPUTER:
+            p1_hand = hands[0] if hands else None
+            p2_hand = None
+            name2_display = COMPUTER_NAME
+        else:
+            p1_hand, p2_hand = assign_hands_to_players(hands, w)
+            name2_display = player2_name
+
         gesture1 = conf1 = None
         gesture2 = conf2 = None
-        probs1 = probs2 = None
+        probs1_full = probs2_full = None
         if p1_hand is not None:
             draw_hand_skeleton(frame, p1_hand["landmarks_px"], ui.CYAN_P1)
             gesture1, conf1 = classify(model, labels, p1_hand["features"])
-            if show_debug:
-                probs1 = get_probabilities(model, labels, p1_hand["features"])
+            probs1_full = get_probabilities(model, labels, p1_hand["features"])
         if p2_hand is not None:
             draw_hand_skeleton(frame, p2_hand["landmarks_px"], ui.MAGENTA_P2)
             gesture2, conf2 = classify(model, labels, p2_hand["features"])
-            if show_debug:
-                probs2 = get_probabilities(model, labels, p2_hand["features"])
+            probs2_full = get_probabilities(model, labels, p2_hand["features"])
         conf1 = conf1 or 0.0
         conf2 = conf2 or 0.0
+        probs1 = probs1_full if show_debug else None
+        probs2 = probs2_full if show_debug else None
 
         ui.dashed_vline(frame, w // 2, HEADER_H + 10, h - FOOTER_H - 10, ui.GRAY, dash=16, gap=12, thickness=2)
 
         title = f"ROUND {round_no}" if state != STATE_GAME_OVER else "MATCH OVER"
-        draw_scoreboard(frame, w, score1, score2, round_no, title, player1_name, player2_name)
-        draw_player_panel(frame, w * 0.22, ui.CYAN_P1, player1_name, gesture1, conf1, probs1)
-        draw_player_panel(frame, w * 0.78, ui.MAGENTA_P2, player2_name, gesture2, conf2, probs2)
+        if game_mode == MODE_VS_COMPUTER:
+            title += "  (VS COMPUTER)"
+        draw_scoreboard(frame, w, score1, score2, round_no, title, player1_name, name2_display)
+        rec1 = get_player_record(game_data, player1_name) if game_mode == MODE_TWO_PLAYER else None
+        rec2 = get_player_record(game_data, player2_name) if game_mode == MODE_TWO_PLAYER else None
+        draw_player_panel(frame, w * 0.22, ui.CYAN_P1, player1_name, gesture1, conf1, probs1, rec1)
+        draw_player_panel(frame, w * 0.78, ui.MAGENTA_P2, name2_display, gesture2, conf2, probs2, rec2)
 
         if state == STATE_IDLE:
+            mode_label = "2-Player" if game_mode == MODE_TWO_PLAYER else "Vs Computer"
             draw_hotkeys(frame, w, h, [
                 ("SPACE", "Start Round", ui.GOLD), ("T", "Retrain", ui.CYAN_P1),
-                ("N", "Names", ui.MAGENTA_P2),
+                ("N", "Names", ui.MAGENTA_P2), ("C", f"Mode: {mode_label}", ui.GOLD),
                 ("D", "Debug" if not show_debug else "Debug: ON", ui.GOLD if show_debug else ui.WHITE),
+                ("M", "Mute" if audio.is_enabled() else "Muted", ui.WHITE),
                 ("R", "Reset", ui.WHITE), ("Q", "Quit", ui.RED),
             ])
             ui.centered_text(frame, "Press SPACE to start!", w // 2, h - FOOTER_H - 20, 0.7, ui.GOLD, 2)
 
         elif state == STATE_COUNTDOWN:
             elapsed = time.time() - countdown_start
-            remaining = 3 - int(elapsed)
             cx, cy = w // 2, (HEADER_H + h - FOOTER_H) // 2
-            pulse = ui.pulse_value(time.time(), speed=6.0, lo=46, hi=60)
-            cv2.circle(frame, (cx, cy), int(pulse), ui.GOLD, 4, cv2.LINE_AA)
             draw_hotkeys(frame, w, h, [("Q", "Quit", ui.RED)])
-            if remaining > 0:
+
+            if elapsed < 3:
+                remaining = 3 - int(elapsed)
+                if remaining != last_tick_second:
+                    last_tick_second = remaining
+                    audio.play_tick()
+                pulse = ui.pulse_value(time.time(), speed=6.0, lo=46, hi=60)
+                cv2.circle(frame, (cx, cy), int(pulse), ui.GOLD, 4, cv2.LINE_AA)
                 ui.centered_text(frame, str(remaining), cx, cy + 20, 2.2, ui.GOLD, 6)
+
+            elif elapsed < 3 + CAPTURE_WINDOW:
+                # پنجره‌ی ثبت: چند فریم پشت‌سرهم را جمع می‌کنیم (هموارسازی زمانی)
+                if not capture_announced:
+                    capture_announced = True
+                    audio.play_go()
+                if probs1_full:
+                    for k, v in probs1_full.items():
+                        prob_sum1[k] = prob_sum1.get(k, 0.0) + v
+                    frames1 += 1
+                if probs2_full:
+                    for k, v in probs2_full.items():
+                        prob_sum2[k] = prob_sum2.get(k, 0.0) + v
+                    frames2 += 1
+                progress = (elapsed - 3) / CAPTURE_WINDOW
+                cv2.circle(frame, (cx, cy), 55, ui.PANEL, -1, cv2.LINE_AA)
+                cv2.ellipse(frame, (cx, cy), (55, 55), -90, 0, int(360 * progress), ui.GREEN, 6, cv2.LINE_AA)
+                ui.centered_text(frame, "HOLD!", cx, cy + 10, 0.9, ui.GREEN, 2)
+
             else:
-                last_g1, last_g2 = gesture1, gesture2
+                if game_mode == MODE_VS_COMPUTER:
+                    last_g1, conf_g1 = resolve_smoothed(prob_sum1, frames1)
+                    last_g2 = computer_move
+                else:
+                    last_g1, conf_g1 = resolve_smoothed(prob_sum1, frames1)
+                    last_g2, conf_g2 = resolve_smoothed(prob_sum2, frames2)
+
                 winner = decide_winner(last_g1, last_g2)
                 if winner == "P1":
                     score1 += 1
-                    last_result_text = "PLAYER 1 WINS THE ROUND!"
+                    last_result_text = f"{player1_name} WINS THE ROUND!"
+                    audio.play_win()
                 elif winner == "P2":
                     score2 += 1
-                    last_result_text = "PLAYER 2 WINS THE ROUND!"
+                    last_result_text = f"{name2_display} WINS THE ROUND!"
+                    audio.play_lose() if game_mode == MODE_VS_COMPUTER else audio.play_win()
                 elif winner == "TIE":
                     last_result_text = "TIE!"
+                    audio.play_tie()
                 else:
                     last_result_text = "DETECT FAILED - TRY AGAIN"
+                    audio.play_tie()
                 round_no += 1
                 result_start = time.time()
                 if score1 >= TARGET_SCORE or score2 >= TARGET_SCORE:
                     state = STATE_GAME_OVER
+                    audio.play_match_win()
+                    if game_mode == MODE_TWO_PLAYER:
+                        winner_nm = player1_name if score1 > score2 else player2_name
+                        loser_nm = player2_name if score1 > score2 else player1_name
+                        record_match_result(game_data, winner_nm, loser_nm)
                 else:
                     state = STATE_RESULT
 
@@ -553,7 +699,7 @@ def main():
 
         elif state == STATE_GAME_OVER:
             cx, cy = w // 2, (HEADER_H + h - FOOTER_H) // 2
-            winner_name = player1_name if score1 > score2 else player2_name
+            winner_name = player1_name if score1 > score2 else name2_display
             winner_color = ui.CYAN_P1 if score1 > score2 else ui.MAGENTA_P2
             ui.rounded_rect(frame, (cx - 260, cy - 110), (cx + 260, cy + 110), ui.PANEL, radius=26, alpha=0.9)
             ui.rounded_rect(frame, (cx - 260, cy - 110), (cx + 260, cy + 110), ui.GOLD, radius=26, thickness=3)
@@ -577,19 +723,33 @@ def main():
             state_before_train = STATE_IDLE
             state = STATE_TRAIN
         elif key == ord('n') and state in (STATE_IDLE, STATE_RESULT, STATE_GAME_OVER):
-            edit_names_buf = [player1_name, player2_name]
+            edit_names_buf = ["", ""]
             edit_active_field = 0
             state_before_edit = state
             state = STATE_EDIT_NAMES
+        elif key == ord('c') and state == STATE_IDLE:
+            game_mode = MODE_VS_COMPUTER if game_mode == MODE_TWO_PLAYER else MODE_TWO_PLAYER
+        elif key == ord('m'):
+            audio.set_enabled(not audio.is_enabled())
         elif key == ord('d'):
             show_debug = not show_debug
         elif key == ord(' ') and state in (STATE_IDLE, STATE_RESULT):
             state = STATE_COUNTDOWN
             countdown_start = time.time()
+            last_tick_second = -1
+            capture_announced = False
+            prob_sum1, frames1 = {}, 0
+            prob_sum2, frames2 = {}, 0
+            computer_move = pick_computer_move() if game_mode == MODE_VS_COMPUTER else None
         elif key == ord(' ') and state == STATE_GAME_OVER:
             score1, score2, round_no = 0, 0, 1
             state = STATE_COUNTDOWN
             countdown_start = time.time()
+            last_tick_second = -1
+            capture_announced = False
+            prob_sum1, frames1 = {}, 0
+            prob_sum2, frames2 = {}, 0
+            computer_move = pick_computer_move() if game_mode == MODE_VS_COMPUTER else None
         elif key == ord('r'):
             score1, score2, round_no = 0, 0, 1
             state = STATE_IDLE
